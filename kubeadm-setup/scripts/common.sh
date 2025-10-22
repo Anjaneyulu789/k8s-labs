@@ -1,28 +1,24 @@
 #!/bin/bash
 #
-# Common setup for all servers (Control Plane and Nodes)
+# Common setup script for Kubernetes Control Plane and Worker Nodes
+# Works on Amazon Linux 2 / CentOS / RHEL-based systems
 
 set -euxo pipefail
 
-# Kuernetes Variable Declaration
+# Kubernetes version
+KUBERNETES_VERSION="1.29.0"
 
-KUBERNETES_VERSION="1.29.0-1.1"
-
-# disable swap
+echo "==== Disabling swap ===="
 sudo swapoff -a
+sudo sed -i '/ swap / s/^/#/' /etc/fstab
 
-# keeps the swaf off during reboot
+# Disable swap permanently (in case crontab is used)
 (crontab -l 2>/dev/null; echo "@reboot /sbin/swapoff -a") | crontab - || true
-sudo apt-get update -y
 
+echo "==== Updating system packages ===="
+sudo yum update -y
 
-# Install CRI-O Runtime
-
-OS="xUbuntu_22.04"
-
-VERSION="1.28"
-
-# Create the .conf file to load the modules at bootup
+echo "==== Setting up required kernel modules ===="
 cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
 overlay
 br_netfilter
@@ -31,53 +27,50 @@ EOF
 sudo modprobe overlay
 sudo modprobe br_netfilter
 
-# sysctl params required by setup, params persist across reboots
+# sysctl params required by setup, persist across reboots
 cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
 net.bridge.bridge-nf-call-iptables  = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward                 = 1
 EOF
 
-# Apply sysctl params without reboot
 sudo sysctl --system
 
-cat <<EOF | sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
-deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/$OS/ /
+echo "==== Installing containerd ===="
+sudo yum install -y yum-utils device-mapper-persistent-data lvm2
+sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+sudo sed -i 's/\$releasever/7/g' /etc/yum.repos.d/docker-ce.repo
+sudo yum install -y containerd.io || sudo yum install -y https://download.docker.com/linux/centos/7/x86_64/stable/Packages/containerd.io-1.6.28-3.1.el7.x86_64.rpm
+
+sudo mkdir -p /etc/containerd
+containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+sudo systemctl enable containerd --now
+
+echo "==== Adding Kubernetes repository ===="
+cat <<EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://pkgs.k8s.io/core:/stable:/v1.29/rpm/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://pkgs.k8s.io/core:/stable:/v1.29/rpm/repodata/repomd.xml.key
+exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
 EOF
-cat <<EOF | sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:stable:cri-o:$VERSION.list
-deb http://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/$VERSION/$OS/ /
-EOF
 
-curl -L https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable:cri-o:$VERSION/$OS/Release.key | sudo apt-key --keyring /etc/apt/trusted.gpg.d/libcontainers.gpg add -
-curl -L https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/$OS/Release.key | sudo apt-key --keyring /etc/apt/trusted.gpg.d/libcontainers.gpg add -
+echo "==== Installing Kubernetes components (kubeadm, kubelet, kubectl) ===="
+sudo yum install -y kubelet-${KUBERNETES_VERSION}* kubeadm-${KUBERNETES_VERSION}* kubectl-${KUBERNETES_VERSION}* --disableexcludes=kubernetes
+sudo systemctl enable --now kubelet
 
-sudo apt-get update
-sudo apt-get install cri-o cri-o-runc -y
+# Optional: Install jq for JSON parsing
+sudo yum install -y jq
 
-sudo systemctl daemon-reload
-sudo systemctl enable crio --now
-
-echo "CRI runtime installed susccessfully"
-
-# Install kubelet, kubectl and Kubeadm
-
-sudo apt-get update -y
-sudo apt-get install -y apt-transport-https ca-certificates curl gpg
-
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-1-28-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-1-28-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes-1.28.list
-
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-1-29-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-1-29-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes-1.29.list
-
-sudo apt-get update -y
-sudo apt-get install -y kubelet="$KUBERNETES_VERSION" kubectl="$KUBERNETES_VERSION" kubeadm="$KUBERNETES_VERSION"
-sudo apt-get update -y
-sudo apt-mark hold kubelet kubeadm kubectl
-
-sudo apt-get install -y jq
-
-local_ip="$(ip --json addr show enX0 | jq -r '.[0].addr_info[] | select(.family == "inet") | .local')"
-cat > /etc/default/kubelet << EOF
+# Set node IP dynamically
+local_ip="$(hostname -I | awk '{print $1}')"
+cat <<EOF | sudo tee /etc/default/kubelet
 KUBELET_EXTRA_ARGS=--node-ip=$local_ip
 EOF
+
+echo "==== Common setup completed successfully! ===="
